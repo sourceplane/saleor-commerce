@@ -9,7 +9,7 @@ metadata:
 spec:
   title: "Saleor's Next.js storefront on Cloudflare Workers"
   summary: "Saleor's Next.js storefront (Paper, Vercel's Next.js Saleor Commerce) — home, categories, collections, search, product pages, a cart, a multi-step checkout, accounts and orders, every Saleor read a \"use cache\" entry revalidated by Saleor's webhook — runs as one Cloudflare Worker with Static Assets, its data cache in R2 and its tag cache and revalidation queue in Durable Objects, live before a Saleor store is connected, and becomes an Orun baseline that takes a new storefront from nothing to live on stage and prod in one landing."
-  state: started
+  state: completed
   milestones:
     - name: "SC0 — the spec"
       exitCriteria:
