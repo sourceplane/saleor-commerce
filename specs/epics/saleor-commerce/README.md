@@ -10,7 +10,7 @@ from theirs once they set its URL.**
 
 | | |
 |---|---|
-| Status | In progress — SC1 on main: the site runs on Workers |
+| Status | ✅ Shipped (`baseline-v1`) — proven offline in Baseline CI; not yet live (risk SC-A) |
 | Upstream | [saleor/storefront](https://github.com/saleor/storefront) ("Paper", FSL-1.1-ALv2), at `a6e357a` (2026-10-20) |
 | Reference | [commerce](https://github.com/sourceplane/commerce) — the same OpenNext, R2 and Durable Object shape for a storefront on a hosted commerce API |
 | Key | `SC` |

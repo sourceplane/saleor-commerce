@@ -4,7 +4,7 @@
 |---|---|---|
 | SC0 — the spec | ✅ | SC-1 |
 | SC1 — the storefront on Workers | ✅ | SC-2 |
-| SC2 — a baseline | planned | SC-3 |
+| SC2 — a baseline | ✅ | SC-3, tagged `baseline-v1` |
 
 ## Departures from the upstream template
 
