@@ -1,0 +1,11 @@
+{
+  "cloudflare-r2/dev": {
+    "r2_bucket_name": "dev-saleor-commerce-dev"
+  },
+  "cloudflare-r2/stage": {
+    "r2_bucket_name": "stg-saleor-commerce-stage"
+  },
+  "cloudflare-r2/prod": {
+    "r2_bucket_name": "prod-saleor-commerce-prod"
+  }
+}

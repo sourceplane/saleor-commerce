@@ -1,0 +1,120 @@
+apiVersion: sourceplane.io/v1
+kind: Component
+metadata:
+  name: web
+  description: The Saleor storefront (Next.js on Cloudflare Workers + Static Assets via @opennextjs/cloudflare, per environment; R2 + Durable Objects as the Next.js cache; a "connect your Saleor store" page until a store is connected)
+spec:
+  type: cloudflare-workers-assets-turbo
+  lifecycle: production
+  owner: platform
+  # Its pages, attached to it in the workspace's catalog: what the Docs
+  # library shows for it, and what the catalog's docs and runbook checks read.
+  # Generated from what this manifest and its sources declare.
+  docs:
+    overview: docs/overview.md
+    pages:
+      - { path: docs/architecture.md, role: architecture, title: Architecture }
+      - { path: docs/runbook.md, role: runbook, title: Runbook }
+  # `app`, not `web`: a domain and a component share one name space in the
+  # catalog, and a domain called `web` hid this component from it.
+  domain: app
+  path: apps/web
+  # Its own lane per environment: the Next.js build is the longest job in the
+  # plan, and a shared lane would wait on it.
+  lane: isolated
+  # INFRA BEFORE APP. The R2 bucket is the Worker's incremental cache, bound
+  # by name, and the name is rendered into its config during the build from
+  # the wiring document the cloudflare-r2 root lease-publishes after its
+  # apply. A job resolves its secrets when it STARTS, so on a merge to main
+  # this deploy waits for that environment's apply (enforced) and the document
+  # is there; a pull request deploys nothing, so nothing on one waits
+  # (advisory). The Durable Objects (tag cache, revalidation queue) need no
+  # root — the Worker exports their classes and the migration creates them on
+  # deploy.
+  dependsOn:
+    - component: cloudflare-r2
+      mode: enforced
+      modeRules:
+        - mode: advisory
+          when:
+            triggerRef: github-pull-request
+  secretEnv:
+    WIRING_CLOUDFLARE_R2_STAGE: "secret://saleor-commerce/saleor-commerce/stage/WIRING_CLOUDFLARE_R2"
+    WIRING_CLOUDFLARE_R2_PROD: "secret://saleor-commerce/saleor-commerce/prod/WIRING_CLOUDFLARE_R2"
+  # The store, connected after the build by its owner: the Saleor API's
+  # GraphQL URL and the channel to sell in, per environment. The build inlines
+  # both (the browser's checkout talks to the same API), so they are build
+  # env, not Worker secrets; when absent — every fresh product — the
+  # storefront builds without calling Saleor and says "Connect your Saleor
+  # store" (src/lib/saleor-connection.ts). The URL is not a credential;
+  # the revalidation secrets and an app token are Worker secrets the owner
+  # sets (the README's "Connecting Saleor").
+  optionalSecretEnv:
+    NEXT_PUBLIC_SALEOR_API_URL: "secret://saleor-commerce/saleor-commerce/{{ .environment }}/SALEOR_API_URL"
+    NEXT_PUBLIC_DEFAULT_CHANNEL: "secret://saleor-commerce/saleor-commerce/{{ .environment }}/SALEOR_CHANNEL"
+  subscribe:
+    environments:
+      - name: dev
+        profile: verify
+      - name: stage
+        profile: verify
+        profileRules:
+          - profile: deploy
+            when:
+              triggerRef: github-push-main
+      - name: prod
+        profile: verify
+        profileRules:
+          - profile: deploy
+            when:
+              triggerRef: github-push-main
+  parameters:
+    nodeVersion: "22"
+    pnpmVersion: "10.12.1"
+
+    workspaceDir: ../..
+    appDir: .
+
+    turboFilter: "@app/web"
+    wranglerConfig: wrangler.jsonc
+
+    # @opennextjs/cloudflare emits a Worker entrypoint plus a static-assets
+    # directory bound via ASSETS — both deploy in one `wrangler deploy`.
+    workerEntrypoint: .open-next/worker.js
+    assetsDir: .open-next/assets
+
+    # Per-env worker name: saleor-commerce-web-{dev,stage,prod}. The rendered
+    # wrangler.jsonc names the same Worker (its self-reference binding needs it).
+    workerName: saleor-commerce-web
+    environmentAwareWorkerName: true
+
+    # The account's workers.dev subdomain; exported to the smoke step as
+    # ${WORKERS_DEV_SUBDOMAIN} and used to build ${DEPLOYED_URL}.
+    workersDevSubdomain: your-workers-subdomain
+
+    installCommand: pnpm install --frozen-lockfile
+    # Render this environment's wrangler config, then build. stage and prod
+    # render from the wiring document their cloudflare-r2 apply published
+    # (secretEnv above, resolved before the job's first step); dev, which no
+    # root applies to and which only verifies, renders from the committed
+    # fixture. The committed wrangler.jsonc (the fixture render) is what the
+    # composition's verify-app-structure step finds before this runs. The
+    # build is for this environment's origin: NEXT_PUBLIC_STOREFRONT_URL (the
+    # storefront's canonical, Open Graph and redirect-allowlist origin) is the
+    # environment's SITE_URL (intent.yaml), else its workers.dev URL; the
+    # channel is Saleor's own default unless the owner named one.
+    buildCommand: node ../../tooling/wire/live.mjs --template wrangler.template.jsonc --out wrangler.jsonc --components cloudflare-r2 --env "${ORUN_ENVIRONMENT}" --fixture wiring.fixture.json --fixture-envs dev && NEXT_PUBLIC_STOREFRONT_URL="${SITE_URL:-https://saleor-commerce-web-${ORUN_ENVIRONMENT}.your-workers-subdomain.workers.dev}" NEXT_PUBLIC_DEFAULT_CHANNEL="${NEXT_PUBLIC_DEFAULT_CHANNEL:-default-channel}" pnpm exec turbo run build --filter=@app/web
+
+    # Smoke: the storefront answers (`/` is the store's home, or before a
+    # store is connected the page that says how to connect one), and the
+    # Worker itself answers /api/health, which no static file can. Not the
+    # store's name: that is the owner's to change, and HTML-escaped when it
+    # carries an `&` or `'`. Not a product either: before a store is connected
+    # there is none, and a connected store may be empty. Buffered before grep
+    # so an early match cannot SIGPIPE curl.
+    smokeCommand: 'curl -sfL -o /dev/null "${DEPLOYED_URL}/" && health=$(curl -sf "${DEPLOYED_URL}/api/health") && echo "${health}" | grep -q "\"ok\":true"'
+  labels:
+    team: platform
+    layer: delivery
+    surface: web
+    runtime: cloudflare

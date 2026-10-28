@@ -1,0 +1,11 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "extends": ["//"],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": [".open-next/**", ".next/**", "!.next/cache/**"],
+      "env": ["CONTENT_PROVIDER", "STOREFRONT_CHANNELS", "STOREFRONT_DISCOVER_CHANNELS"]
+    }
+  }
+}

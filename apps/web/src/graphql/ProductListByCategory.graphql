@@ -1,0 +1,61 @@
+query ProductListByCategory(
+	$slug: String!
+	$channel: String!
+	$languageCode: LanguageCodeEnum!
+	$slugLanguageCode: LanguageCodeEnum
+	$first: Int
+	$after: String
+	$last: Int
+	$before: String
+	$sortBy: ProductOrder
+	$filter: ProductFilterInput
+	$where: ProductWhereInput
+) {
+	category(slug: $slug, slugLanguageCode: $slugLanguageCode) {
+		...CategoryDetailsExtension
+		id
+		name
+		slug
+		description
+		seoDescription
+		seoTitle
+		translation(languageCode: $languageCode) {
+			name
+			description
+			seoDescription
+			seoTitle
+			slug
+		}
+		...CategoryLocaleSlugTranslations
+		# Full-bleed hero. Unsized, Saleor returns the 4096 rung in the original format —
+		# a multi-MB JPEG that Vercel then has to transcode.
+		backgroundImage(size: 2048, sizeRounding: UP, format: WEBP) {
+			url
+			alt
+		}
+		products(
+			first: $first
+			after: $after
+			last: $last
+			before: $before
+			channel: $channel
+			sortBy: $sortBy
+			filter: $filter
+			where: $where
+		) {
+			edges {
+				node {
+					...ProductListItem
+				}
+				cursor
+			}
+			pageInfo {
+				hasNextPage
+				hasPreviousPage
+				startCursor
+				endCursor
+			}
+			totalCount
+		}
+	}
+}

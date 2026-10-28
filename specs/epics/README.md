@@ -7,6 +7,6 @@ folder is the adoption; the merge creates the epic in the workspace.
 
 | Epic | Cluster | Status | What it is |
 |------|---------|--------|------------|
-| [`saleor-commerce/`](./saleor-commerce/) | **SC** | In progress (SC0) | Saleor's Next.js storefront (Vercel's Next.js Saleor Commerce) on Cloudflare Workers, its Saleor reads cached in R2 and revalidated by Saleor's webhook — and an Orun baseline that instantiates it in one landing, live before a store is connected (SC2) |
+| [`saleor-commerce/`](./saleor-commerce/) | **SC** | In progress (SC1: the site on Workers) | Saleor's Next.js storefront (Vercel's Next.js Saleor Commerce) on Cloudflare Workers, its Saleor reads cached in R2 and revalidated by Saleor's webhook — and an Orun baseline that instantiates it in one landing, live before a store is connected (SC2) |
 
 As-built ≠ intent: what shipped lives in each epic's `IMPLEMENTATION-STATUS.md`.

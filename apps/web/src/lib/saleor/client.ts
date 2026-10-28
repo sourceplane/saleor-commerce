@@ -1,0 +1,607 @@
+import "server-only";
+
+import { io } from "next/cache";
+import packageJson from "../../../package.json";
+import { type TypedDocumentString } from "../../gql/graphql";
+import { recordResponse, takeReplay } from "./fixtures";
+import { recordSaleorCall } from "./ledger";
+
+const USER_AGENT = `${packageJson.name}/${packageJson.version}`;
+
+// ============================================================================
+// Result Types - Explicit error handling without exceptions
+// ============================================================================
+
+/**
+ * Error layers in order of occurrence:
+ * 1. network - Failed to reach server (timeout, DNS, connection refused)
+ * 2. http - Server responded with error status (4xx, 5xx)
+ * 3. graphql - Query/mutation syntax or validation errors
+ * 4. validation - Saleor domain errors (e.g., "email already exists")
+ */
+export type GraphQLErrorType = "network" | "http" | "graphql" | "validation";
+
+export interface GraphQLError {
+	type: GraphQLErrorType;
+	message: string;
+	/** HTTP status code (only for 'http' type) */
+	statusCode?: number;
+	/** Whether the request could succeed if retried */
+	isRetryable: boolean;
+	/** Saleor error codes from `errors[].extensions.code` (only for 'graphql' type) */
+	codes?: readonly string[];
+	/** Original error for debugging */
+	cause?: unknown;
+	/** Saleor validation errors with field info (only for 'validation' type) */
+	validationErrors?: ReadonlyArray<{
+		field?: string | null;
+		message: string;
+		code?: string | null;
+	}>;
+}
+
+/** One entry of a GraphQL `errors` array that arrived next to partial `data`. */
+export interface GraphQLPartialError {
+	message: string;
+	code?: string;
+	path?: readonly (string | number)[];
+}
+
+/** Success result with data */
+export interface GraphQLSuccess<T> {
+	ok: true;
+	data: T;
+	/**
+	 * Saleor resolved part of the query and failed the rest. The failed fields are
+	 * `null` in `data`. `cachedQuery` throws on these; uncached reads may render them.
+	 */
+	partialErrors?: readonly GraphQLPartialError[];
+}
+
+/** Error result with typed error */
+export interface GraphQLFailure {
+	ok: false;
+	error: GraphQLError;
+}
+
+/** Result type - either success with data or failure with error */
+export type GraphQLResult<T> = GraphQLSuccess<T> | GraphQLFailure;
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+function networkError(message: string, cause?: unknown): GraphQLFailure {
+	return {
+		ok: false,
+		error: { type: "network", message, isRetryable: true, cause },
+	};
+}
+
+function httpError(statusCode: number, message: string): GraphQLFailure {
+	return {
+		ok: false,
+		error: {
+			type: "http",
+			message,
+			statusCode,
+			isRetryable: statusCode >= 500 || statusCode === 429,
+		},
+	};
+}
+
+function graphqlError(messages: string[], codes: string[] = []): GraphQLFailure {
+	return {
+		ok: false,
+		error: {
+			type: "graphql",
+			message: messages.join("\n"),
+			isRetryable: false,
+			...(codes.length > 0 ? { codes } : {}),
+		},
+	};
+}
+
+function validationError(
+	errors: ReadonlyArray<{ field?: string | null; message: string; code?: string | null }>,
+): GraphQLFailure {
+	return {
+		ok: false,
+		error: {
+			type: "validation",
+			message: errors.map((e) => e.message).join(", "),
+			isRetryable: false,
+			validationErrors: errors,
+		},
+	};
+}
+
+function success<T>(data: T): GraphQLSuccess<T> {
+	return { ok: true, data };
+}
+
+/** User-friendly message for each error type */
+export function getUserMessage(error: GraphQLError): string {
+	switch (error.type) {
+		case "network":
+			return "Unable to connect to the store. Please check your internet connection.";
+		case "http":
+			if (error.statusCode === 401 || error.statusCode === 403) {
+				return "You don't have permission to view this content.";
+			}
+			if (error.statusCode === 404) {
+				return "The item you're looking for doesn't exist or has been removed.";
+			}
+			return "The store is temporarily unavailable. Please try again in a moment.";
+		case "graphql":
+			return "Something went wrong loading this page.";
+		case "validation":
+			return error.message || "Please check your input and try again.";
+	}
+}
+
+// ============================================================================
+// Request Queue for Rate Limiting
+// ============================================================================
+
+class RequestQueue {
+	private queue: Array<() => void> = [];
+	private activeRequests = 0;
+	private readonly maxConcurrent: number;
+	private readonly minDelayMs: number;
+
+	constructor(maxConcurrent = 3, minDelayMs = 300) {
+		this.maxConcurrent = maxConcurrent;
+		this.minDelayMs = minDelayMs;
+	}
+
+	async enqueue<T>(fn: () => Promise<T>): Promise<T> {
+		await this.waitForSlot();
+		this.activeRequests++;
+
+		try {
+			if (this.minDelayMs <= 0) {
+				return await fn();
+			}
+			const [result] = await Promise.all([fn(), sleep(this.minDelayMs)]);
+			return result;
+		} finally {
+			this.activeRequests--;
+			this.processQueue();
+		}
+	}
+
+	private waitForSlot(): Promise<void> {
+		if (this.activeRequests < this.maxConcurrent) {
+			return Promise.resolve();
+		}
+		return new Promise((resolve) => this.queue.push(resolve));
+	}
+
+	private processQueue(): void {
+		if (this.queue.length > 0 && this.activeRequests < this.maxConcurrent) {
+			const next = this.queue.shift();
+			next?.();
+		}
+	}
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatVariablesForLog(variables: Record<string, unknown>): string {
+	const parts: string[] = [];
+	for (const [key, value] of Object.entries(variables)) {
+		if (value === undefined || value === null) continue;
+		const strValue = typeof value === "string" ? value : JSON.stringify(value);
+		const truncated = strValue.length > 30 ? strValue.slice(0, 30) + "…" : strValue;
+		parts.push(`${key}=${truncated}`);
+	}
+	return parts.length > 0 ? `(${parts.join(", ")})` : "";
+}
+
+/**
+ * The inter-request delay exists to survive `next build`, where `generateStaticParams`
+ * fans out enough parallel requests to trip Saleor's rate limiter. At runtime the
+ * concurrency cap already bounds pressure, so the delay only adds latency to every
+ * request — and on Fluid Compute you pay for that wall time. Default it off at runtime.
+ */
+const isBuildPhase = process.env.NEXT_PHASE === "phase-production-build";
+
+const requestQueue = new RequestQueue(
+	parseInt(process.env.SALEOR_MAX_CONCURRENT_REQUESTS || "3", 10),
+	parseInt(process.env.SALEOR_MIN_REQUEST_DELAY_MS || (isBuildPhase ? "200" : "0"), 10),
+);
+
+function getRetryConfig(overrides?: { maxRetries?: number; timeoutMs?: number }) {
+	const buildRetries = process.env.NEXT_BUILD_RETRIES;
+	const timeoutMs = parseInt(process.env.SALEOR_REQUEST_TIMEOUT_MS || "15000", 10);
+	const base =
+		buildRetries !== undefined
+			? { maxRetries: parseInt(buildRetries, 10), delayMs: 500, timeoutMs }
+			: { maxRetries: 3, delayMs: 1000, timeoutMs };
+
+	return {
+		maxRetries: overrides?.maxRetries ?? base.maxRetries,
+		delayMs: base.delayMs,
+		timeoutMs: overrides?.timeoutMs ?? base.timeoutMs,
+	};
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+	const controller = new AbortController();
+	const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+	try {
+		return await fetch(url, { ...init, signal: controller.signal });
+	} finally {
+		clearTimeout(timeoutId);
+	}
+}
+
+// ============================================================================
+// Core Fetch with Retry
+// ============================================================================
+
+/** How to authenticate the request — session cookies or app token, never both. */
+export type GraphQLAuth = "none" | "session" | "app";
+
+type FetchResult = GraphQLSuccess<Response> | GraphQLFailure;
+
+type RetryOverrides = {
+	maxRetries?: number;
+	timeoutMs?: number;
+	/** When set, session auth honors `timeoutMs` via AbortSignal. Default session fetches stay untimed. */
+	abortSession?: boolean;
+};
+
+async function fetchWithRetry(
+	input: RequestInit,
+	auth: GraphQLAuth,
+	operationName: string,
+	variablesForLog?: string,
+	retry?: RetryOverrides,
+): Promise<FetchResult> {
+	const url = process.env.NEXT_PUBLIC_SALEOR_API_URL;
+	if (!url) {
+		return networkError("Missing NEXT_PUBLIC_SALEOR_API_URL env variable");
+	}
+
+	const { maxRetries, delayMs, timeoutMs } = getRetryConfig(retry);
+	const requestBody = typeof input.body === "string" ? input.body : undefined;
+	const replayed = takeReplay(operationName, requestBody);
+	if (replayed.status === "miss") return networkError(`${operationName}: ${replayed.message}`);
+	if (replayed.status === "hit") return success(replayed.response);
+
+	for (let attempt = 0; attempt <= maxRetries; attempt++) {
+		try {
+			let response: Response;
+
+			if (auth === "session") {
+				const { getServerAuthClient } = await import("@/lib/auth/server");
+				const client = await getServerAuthClient();
+				if (retry?.abortSession) {
+					const controller = new AbortController();
+					const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+					try {
+						response = await client.fetchWithAuth(url, { ...input, signal: controller.signal });
+					} finally {
+						clearTimeout(timeoutId);
+					}
+				} else {
+					response = await client.fetchWithAuth(url, input);
+				}
+			} else {
+				response = await fetchWithTimeout(url, input, timeoutMs);
+			}
+
+			// Retry on 429 (rate limit) or 5xx (server errors)
+			if ((response.status === 429 || response.status >= 500) && attempt < maxRetries) {
+				const retryAfter = response.headers.get("Retry-After");
+				const retryDelayMs = retryAfter ? parseInt(retryAfter, 10) * 1000 : delayMs * Math.pow(2, attempt);
+				console.warn(
+					`[GraphQL] ${operationName}${variablesForLog ? ` ${variablesForLog}` : ""}: HTTP ${
+						response.status
+					} - retrying in ${retryDelayMs}ms (attempt ${attempt + 1}/${maxRetries})`,
+				);
+				await sleep(retryDelayMs);
+				continue;
+			}
+
+			return success(await recordResponse(operationName, requestBody, response, auth));
+		} catch (error) {
+			const isTimeout = error instanceof Error && error.name === "AbortError";
+			if (attempt < maxRetries) {
+				const errorType = isTimeout ? `Timeout (>${timeoutMs}ms)` : "Network error";
+				console.warn(
+					`[GraphQL] ${operationName}${
+						variablesForLog ? ` ${variablesForLog}` : ""
+					}: ${errorType} - retrying (attempt ${attempt + 1}/${maxRetries})`,
+				);
+				await sleep(delayMs * Math.pow(2, attempt));
+				continue;
+			}
+			return networkError(
+				`${operationName}: ${isTimeout ? "Request timed out" : "Failed to connect to Saleor API"}`,
+				error,
+			);
+		}
+	}
+
+	return networkError(`${operationName}: Max retries exceeded`);
+}
+
+// ============================================================================
+// GraphQL Execution
+// ============================================================================
+
+export type GraphQLOptions<Variables> = {
+	headers?: HeadersInit;
+	/**
+	 * Internal only. `liveQuery` / `sessionQuery` / `mutate` pass `no-cache`.
+	 * Cached reads omit it so `"use cache"` owns freshness. There is no `revalidate`.
+	 */
+	cache?: RequestCache;
+	/** Set by the access-mode wrappers for the dev ledger. */
+	ledgerMode?: string;
+	/** Override the default retry count (runtime: 3). Use `0` for best-effort side effects. */
+	maxRetries?: number;
+	/** Override `SALEOR_REQUEST_TIMEOUT_MS`. Also applies to session auth (otherwise untimed). */
+	timeoutMs?: number;
+} & (Variables extends Record<string, never> ? { variables?: never } : { variables: Variables });
+
+type GraphQLResponseBody<T> = {
+	data?: T | null;
+	errors?: readonly {
+		message?: string | null;
+		path?: readonly (string | number)[] | null;
+		extensions?: { code?: string | null } | null;
+	}[];
+};
+
+/** Extract Saleor error codes from `errors[].extensions.code` (e.g. `ExpiredSignatureError`). */
+function extractErrorCodes(errors: GraphQLResponseBody<unknown>["errors"]): string[] {
+	return errors?.map((e) => e.extensions?.code).filter((c): c is string => Boolean(c)) ?? [];
+}
+
+function toPartialErrors(errors: GraphQLResponseBody<unknown>["errors"]): GraphQLPartialError[] {
+	return (errors ?? []).map((e) => ({
+		message: e.message || "Unknown GraphQL error",
+		...(e.extensions?.code ? { code: e.extensions.code } : {}),
+		...(e.path ? { path: e.path } : {}),
+	}));
+}
+
+/**
+ * Internal base GraphQL executor. Returns a Result type.
+ */
+export async function executeGraphQL<Result, Variables>(
+	operation: TypedDocumentString<Result, Variables>,
+	options: GraphQLOptions<Variables> & { auth: GraphQLAuth },
+): Promise<GraphQLResult<Result>> {
+	const { variables, headers, cache, auth, maxRetries, timeoutMs, ledgerMode } = options;
+
+	// `Date.now()` during a page prerender makes the route blocking. Search and other
+	// live reads hit that clock here, and session auth hits it again inside
+	// `@saleor/auth-sdk`'s `fetchWithAuth`. `io()` moves this call into the dynamic
+	// stage first. Cached reads omit `cache: "no-cache"` and must not call `io()` —
+	// they run inside `"use cache"`.
+	if (cache === "no-cache") {
+		await io();
+	}
+
+	const started = Date.now();
+
+	const operationName = operation.toString().match(/(?:query|mutation)\s+(\w+)/)?.[1] || "UnknownOperation";
+	const variablesForLog = variables ? formatVariablesForLog(variables) : undefined;
+	const finish = (result: GraphQLResult<Result>): GraphQLResult<Result> => {
+		recordSaleorCall({
+			op: operationName,
+			mode: ledgerMode ?? "raw",
+			auth,
+			ok: result.ok,
+			ms: Date.now() - started,
+		});
+		return result;
+	};
+
+	if (process.env.NODE_ENV === "development" && process.env.DEBUG_CACHE) {
+		console.log(
+			`[GraphQL] ${operationName} | auth: ${auth} | cache: ${cache || "default"} | mode: ${ledgerMode || "raw"}`,
+		);
+	}
+
+	const requestHeaders: Record<string, string> = {
+		"Content-Type": "application/json",
+		"User-Agent": USER_AGENT,
+		...(headers as Record<string, string> | undefined),
+	};
+
+	if (auth === "app") {
+		const token = process.env.SALEOR_APP_TOKEN;
+		if (!token) {
+			return finish(networkError("Missing SALEOR_APP_TOKEN"));
+		}
+		requestHeaders.Authorization = `Bearer ${token}`;
+	}
+
+	const input: RequestInit = {
+		method: "POST",
+		headers: requestHeaders,
+		body: JSON.stringify({
+			query: operation.toString(),
+			...(variables && { variables }),
+		}),
+		...(cache !== undefined ? { cache } : {}),
+	};
+
+	const fetchResult = await requestQueue.enqueue(() =>
+		fetchWithRetry(input, auth, operationName, variablesForLog, {
+			maxRetries,
+			timeoutMs,
+			abortSession: timeoutMs !== undefined,
+		}),
+	);
+
+	if (!fetchResult.ok) {
+		return finish(fetchResult);
+	}
+
+	const response = fetchResult.data;
+
+	if (!response.ok) {
+		const body = await response.text().catch(() => "");
+		return finish(httpError(response.status, `HTTP ${response.status}: ${response.statusText}\n${body}`));
+	}
+
+	const body = (await response.json()) as GraphQLResponseBody<Result>;
+	const messages = body.errors?.map((e) => e.message).filter((m): m is string => Boolean(m)) ?? [];
+
+	// GraphQL allows partial success — return data when Saleor included it, and keep
+	// the errors: a failed resolver reads as `null`, which a cached read must not keep.
+	if (body.data !== null && body.data !== undefined) {
+		if (body.errors?.length) {
+			const partialErrors = toPartialErrors(body.errors);
+			console.warn(
+				`[GraphQL] ${operationName}${variablesForLog ? ` ${variablesForLog}` : ""}: partial data with ${
+					partialErrors.length
+				} error(s): ${partialErrors.map((e) => e.message).join(" | ")}`,
+			);
+			return finish({ ...success(body.data), partialErrors });
+		}
+		return finish(success(body.data));
+	}
+
+	if (messages.length > 0) {
+		return finish(graphqlError(messages, extractErrorCodes(body.errors)));
+	}
+
+	return finish(graphqlError(["No data in GraphQL response"]));
+}
+
+// ============================================================================
+// Raw GraphQL Execution (for API routes without codegen)
+// ============================================================================
+
+interface RawGraphQLOptions {
+	query: string;
+	variables?: Record<string, unknown>;
+	headers?: HeadersInit;
+}
+
+/**
+ * Execute a raw GraphQL mutation without codegen types.
+ * Use this for API routes (auth, etc.) that don't use codegen.
+ *
+ * @example
+ * const result = await executeRawGraphQL({
+ *   query: `mutation Register($input: AccountRegisterInput!) { ... }`,
+ *   variables: { input: { email, password } },
+ * });
+ *
+ * if (!result.ok) {
+ *   return NextResponse.json({ error: result.error.message }, { status: 400 });
+ * }
+ *
+ * // Access mutation result
+ * const { accountRegister } = result.data;
+ * if (accountRegister.errors?.length) {
+ *   return validationErrorResponse(accountRegister.errors);
+ * }
+ */
+export async function executeRawGraphQL<T = unknown>(options: RawGraphQLOptions): Promise<GraphQLResult<T>> {
+	const url = process.env.NEXT_PUBLIC_SALEOR_API_URL;
+	if (!url) {
+		return networkError("Missing NEXT_PUBLIC_SALEOR_API_URL env variable");
+	}
+
+	const { query, variables, headers } = options;
+	const operationName = query.match(/(?:query|mutation)\s+(\w+)/)?.[1] || "RawOperation";
+
+	try {
+		const response = await fetch(url, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT, ...headers },
+			body: JSON.stringify({ query, variables }),
+		});
+
+		if (!response.ok) {
+			const body = await response.text().catch(() => "");
+			return httpError(response.status, `HTTP ${response.status}: ${response.statusText}\n${body}`);
+		}
+
+		const body = (await response.json()) as GraphQLResponseBody<T>;
+		const messages = body.errors?.map((e) => e.message).filter((m): m is string => Boolean(m)) ?? [];
+
+		if (body.data !== null && body.data !== undefined) {
+			return success(body.data);
+		}
+
+		if (messages.length > 0) {
+			return graphqlError(messages, extractErrorCodes(body.errors));
+		}
+
+		return graphqlError(["No data in GraphQL response"]);
+	} catch (error) {
+		return networkError(`${operationName}: Failed to execute`, error);
+	}
+}
+
+/**
+ * Helper to create a validation error result from Saleor mutation errors.
+ * Use after checking the mutation response for domain errors.
+ *
+ * @example
+ * const { accountRegister } = result.data;
+ * if (accountRegister.errors?.length) {
+ *   return asValidationError(accountRegister.errors);
+ * }
+ */
+export function asValidationError(
+	errors: ReadonlyArray<{ field?: string | null; message: string; code?: string | null }>,
+): GraphQLFailure {
+	return validationError(errors);
+}
+
+// ============================================================================
+// Legacy exports (for gradual migration)
+// ============================================================================
+
+// Re-export error types for backwards compatibility during migration
+export type SaleorErrorType = GraphQLErrorType;
+
+/**
+ * @deprecated Use Result pattern instead. This class is kept for gradual migration.
+ */
+export class SaleorError extends Error {
+	public readonly type: SaleorErrorType;
+	public readonly statusCode?: number;
+	public readonly isRetryable: boolean;
+
+	constructor(
+		message: string,
+		options: {
+			type: SaleorErrorType;
+			statusCode?: number;
+			isRetryable?: boolean;
+			cause?: unknown;
+		},
+	) {
+		super(message, { cause: options.cause });
+		this.name = "SaleorError";
+		this.type = options.type;
+		this.statusCode = options.statusCode;
+		this.isRetryable = options.isRetryable ?? (options.type === "network" || options.type === "http");
+		Object.setPrototypeOf(this, new.target.prototype);
+	}
+
+	get userMessage(): string {
+		return getUserMessage({
+			type: this.type,
+			message: this.message,
+			statusCode: this.statusCode,
+			isRetryable: this.isRetryable,
+		});
+	}
+}

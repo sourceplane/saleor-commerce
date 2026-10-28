@@ -1,0 +1,52 @@
+mutation CheckoutCreate($channel: String!, $languageCode: LanguageCodeEnum!, $metadata: [MetadataInput!]) {
+	checkoutCreate(input: { channel: $channel, languageCode: $languageCode, lines: [], metadata: $metadata }) {
+		checkout {
+			id
+			email
+			lines {
+				id
+				quantity
+				totalPrice {
+					gross {
+						amount
+						currency
+					}
+				}
+				variant {
+					product {
+						id
+						name
+						slug
+						thumbnail(size: 256, sizeRounding: UP, format: WEBP) {
+							url
+							alt
+						}
+						category {
+							name
+						}
+					}
+					pricing {
+						price {
+							gross {
+								amount
+								currency
+							}
+						}
+					}
+					name
+					id
+				}
+			}
+			totalPrice {
+				gross {
+					amount
+					currency
+				}
+			}
+		}
+		errors {
+			field
+			code
+		}
+	}
+}
