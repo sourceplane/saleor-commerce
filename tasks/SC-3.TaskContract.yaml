@@ -1,0 +1,23 @@
+apiVersion: orun.io/v1
+kind: TaskContract
+metadata:
+  name: SC-3
+  title: "saleor-commerce becomes an Orun baseline"
+spec:
+  goal: A new storefront goes from nothing to live on stage and prod in one landing, its own name throughout, with Baseline CI proving it offline
+  affects:
+    - blueprint.yaml
+    - repo-blueprint.yaml
+    - .baseline
+    - testing
+    - tooling
+    - hooks
+    - docs/phases
+    - ai/context
+    - .github/workflows
+    - BOOTSTRAP.md
+    - README.md
+  doneWhen:
+    - Baseline CI is green on main
+    - baseline-v1 is tagged
+  gates: []
