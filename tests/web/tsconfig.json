@@ -1,0 +1,19 @@
+{
+  // The storefront's own compiler options (apps/web/tsconfig.json), because
+  // these tests import its sources and tsc checks every file it reaches under
+  // the importing project's options; only the paths and the files differ.
+  "extends": "../../apps/web/tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "incremental": false,
+    "types": ["node"],
+    "paths": {
+      "@/*": ["../../apps/web/src/*"],
+      "@ui/*": ["../../apps/web/src/components/*"],
+      "@paper/session-bridge": ["../../apps/web/src/session-bridge/index.ts"]
+    },
+    "plugins": []
+  },
+  "include": ["src/**/*.ts", "../../apps/web/global.d.ts"],
+  "exclude": ["node_modules"]
+}

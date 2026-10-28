@@ -1,0 +1,10 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "extends": ["//"],
+  "tasks": {
+    "typecheck": { "dependsOn": ["^build", "@app/web#typecheck"] },
+    "test": { "dependsOn": ["^build", "@app/web#test"] },
+    "build": { "dependsOn": ["^build", "@app/web#build"] },
+    "lint": { "dependsOn": ["@app/web#typecheck"] }
+  }
+}

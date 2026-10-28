@@ -1,0 +1,53 @@
+// GENERATED from wrangler.template.jsonc by tooling/wire — edit the
+// template, not this file. The committed copy is the fixture render
+// (`pnpm run wire:fixture`); every Orun lane renders its own environment.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "saleor-commerce-web-stage",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS",
+  },
+  "observability": { "enabled": true },
+  // No `vars`: the store's name is src/config/brand.ts (SITE_NAME), and the
+  // Saleor API URL and channel are inlined by the build from the product's
+  // Orun secrets (component.yaml); until they are set the storefront says
+  // "Connect your Saleor store". The revalidation secrets are Worker secrets
+  // an owner sets with `wrangler secret put` (the README's "Connecting
+  // Saleor").
+
+  // The Next.js incremental cache — pre-rendered pages and `"use cache"`
+  // entries — in the bucket infra/terraform/cloudflare-r2 provisions.
+  "r2_buckets": [
+    {
+      "binding": "NEXT_INC_CACHE_R2_BUCKET",
+      "bucket_name": "stg-saleor-commerce-stage",
+    },
+  ],
+  // The tag cache (which tags `revalidateTag` invalidated, and when) and the
+  // revalidation queue: Durable Objects the generated Worker exports, created
+  // by the migration on first deploy.
+  "durable_objects": {
+    "bindings": [
+      { "name": "NEXT_CACHE_DO_QUEUE", "class_name": "DOQueueHandler" },
+      {
+        "name": "NEXT_TAG_CACHE_DO_SHARDED",
+        "class_name": "DOShardedTagCache",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["DOQueueHandler", "DOShardedTagCache"],
+    },
+  ],
+  // The queue revalidates a stale route by requesting it from the Worker
+  // itself.
+  "services": [
+    { "binding": "WORKER_SELF_REFERENCE", "service": "saleor-commerce-web-stage" },
+  ],
+}

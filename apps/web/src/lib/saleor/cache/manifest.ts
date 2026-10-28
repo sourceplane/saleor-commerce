@@ -1,0 +1,747 @@
+import { cacheLife, cacheTag } from "next/cache";
+import { extensionCacheProfiles } from "../extensions";
+import { getStaticStorefrontChannelSlugs } from "@/config/channels";
+import { getDefaultLocaleSlug, getLocaleBcp47List, getStorefrontLocaleSlugs } from "@/config/locale";
+import {
+	DEFAULT_PAPER_CACHE_LIFE_PROFILE,
+	type PaperCacheLifeProfile,
+	paperCacheLifeProfileDocs,
+	resolveRevalidateCacheLifeProfile,
+} from "./life-profiles";
+import {
+	isStorefrontContentPageSlug,
+	resolveStorefrontContentChannelsForPageSlug,
+} from "@/lib/content/constants";
+
+// ============================================================================
+// Cache Profile Definitions — single source of truth
+//
+// **cacheLife profile names** live in src/lib/saleor/cache/life-profiles.ts (with docs).
+// This file maps Saleor cache *tags* to those profiles and builds invalidation paths.
+//
+// Imported by:
+//   - Cached functions (applyCacheProfile → cacheLife + cacheTag)
+//   - Revalidation endpoint (revalidateTag tag + profile)
+//   - /api/cache-info (manifest for dashboard)
+// ============================================================================
+
+const UNRESOLVED_PLACEHOLDER = /\{(slug|channel|locale)\}/;
+
+export type CacheLifeProfile = PaperCacheLifeProfile;
+
+export interface CacheProfile {
+	readonly id: string;
+	readonly label: string;
+	/** Paper cacheLife tier — see src/lib/saleor/cache/life-profiles.ts */
+	readonly cacheProfile: CacheLifeProfile;
+	/** Tag pattern — use {slug} and/or {channel} placeholders */
+	readonly tagPattern: string;
+	/** Path pattern — use {channel} and {slug} as placeholders, or null for non-path caches */
+	readonly pathPattern: string | null;
+	/**
+	 * Catch-all tag applied alongside the entity tag (slug-scoped profiles).
+	 * Full purge (`?all=1`) revalidates this so every product/category/… entry
+	 * is busted without enumerating slugs.
+	 */
+	readonly sharedTag?: string;
+	/**
+	 * Channel-scoped catch-all applied alongside channel+slug tags (listing grids).
+	 * Full purge enumerates it per channel, and webhook events whose payload does
+	 * not name the affected slugs fall back to it — one channel's grids, never
+	 * every channel's.
+	 */
+	readonly sharedTagPattern?: string;
+}
+
+export type CacheTagParams = {
+	slug?: string;
+	channel?: string;
+	/** BCP 47 locale — storefront content cache key (Saleor translations not wired yet). */
+	locale?: string;
+};
+
+const profiles = {
+	products: {
+		id: "products",
+		label: "Product Pages",
+		cacheProfile: "catalog",
+		tagPattern: "product:{slug}",
+		pathPattern: "/{locale}/{channel}/products/{slug}",
+		sharedTag: "products",
+	},
+	categories: {
+		id: "categories",
+		label: "Category Pages",
+		cacheProfile: "catalog",
+		tagPattern: "category:{slug}",
+		pathPattern: "/{locale}/{channel}/categories/{slug}",
+		sharedTag: "categories",
+	},
+	collections: {
+		id: "collections",
+		label: "Collection Pages",
+		cacheProfile: "catalog",
+		tagPattern: "collection:{slug}",
+		pathPattern: "/{locale}/{channel}/collections/{slug}",
+		sharedTag: "collections",
+	},
+	pages: {
+		id: "pages",
+		label: "CMS Pages",
+		cacheProfile: "catalog",
+		tagPattern: "page:{slug}",
+		pathPattern: "/{locale}/{channel}/pages/{slug}",
+		sharedTag: "pages",
+	},
+	/**
+	 * Listing grids (PLP, category, collection) for the *cacheable* views only —
+	 * see `isCacheableListingQuery` in src/lib/listing/cacheability.ts.
+	 *
+	 * Sharded by surface and slug: cache entries are keyed by (slug ×) sort ×
+	 * locale × channel, and the tags follow the key so one product edit busts
+	 * only the grids it can appear in — its category grid, its collections'
+	 * grids, and the all-products grid — instead of every cached grid in the
+	 * channel. Category/collection grids also carry a channel catch-all
+	 * (`sharedTagPattern`) used by full purge and by product events whose
+	 * payload doesn't name the affected grids (unenriched webhooks).
+	 *
+	 * Only product events that can change a listing card revalidate these
+	 * (`affectsListing` in src/lib/saleor/invalidation/webhook-events.ts) — stock and metadata
+	 * churn must not, or the cache never stays warm.
+	 */
+	listingAll: {
+		id: "listing-all",
+		label: "All-Products Listing",
+		cacheProfile: "catalog",
+		tagPattern: "listing:all:{channel}",
+		pathPattern: null,
+	},
+	listingCategory: {
+		id: "listing-category",
+		label: "Category Listings",
+		cacheProfile: "catalog",
+		tagPattern: "listing:category:{channel}:{slug}",
+		pathPattern: null,
+		sharedTagPattern: "listing:category-any:{channel}",
+	},
+	listingCollection: {
+		id: "listing-collection",
+		label: "Collection Listings",
+		cacheProfile: "catalog",
+		tagPattern: "listing:collection:{channel}:{slug}",
+		pathPattern: null,
+		sharedTagPattern: "listing:collection-any:{channel}",
+	},
+	navigation: {
+		id: "navigation",
+		label: "Navigation Menus",
+		cacheProfile: "menus",
+		tagPattern: "navigation:{channel}",
+		pathPattern: null,
+	},
+	footerMenu: {
+		id: "footer-menu",
+		label: "Footer Menu",
+		cacheProfile: "menus",
+		tagPattern: "footer-menu:{channel}",
+		pathPattern: null,
+	},
+	channels: {
+		id: "channels",
+		label: "Channel List",
+		cacheProfile: "channels",
+		tagPattern: "channels",
+		pathPattern: null,
+	},
+	storefrontContent: {
+		id: "storefront-content",
+		label: "Storefront Content",
+		cacheProfile: "menus",
+		tagPattern: "storefront-content:{channel}:{locale}",
+		pathPattern: "/{locale}/{channel}",
+	},
+} as const satisfies Record<string, CacheProfile>;
+
+export const CACHE_PROFILES = profiles;
+
+export const CACHE_PROFILE_LIST: readonly CacheProfile[] = [
+	...Object.values(profiles),
+	...Object.values(extensionCacheProfiles),
+];
+
+/** Saleor menu slugs used by cached layout components — keep in sync with saleor-paper-app storefront-menus.ts */
+export const NAVBAR_MENU_SLUG = "navbar" as const;
+export const FOOTER_MENU_SLUG = "footer" as const;
+
+/** Saleor menu slugs fetched by the storefront → cache profile for invalidation. */
+export const STOREFRONT_MENU_SLUGS = {
+	[NAVBAR_MENU_SLUG]: profiles.navigation,
+	[FOOTER_MENU_SLUG]: profiles.footerMenu,
+} as const satisfies Record<string, CacheProfile>;
+
+export type StorefrontMenuSlug = keyof typeof STOREFRONT_MENU_SLUGS;
+
+export function resolveCacheProfileForMenuSlug(menuSlug: string): CacheProfile | null {
+	if (!isKnownStorefrontMenuSlug(menuSlug)) return null;
+	return STOREFRONT_MENU_SLUGS[menuSlug];
+}
+
+export function isKnownStorefrontMenuSlug(menuSlug: string): menuSlug is StorefrontMenuSlug {
+	return menuSlug in STOREFRONT_MENU_SLUGS;
+}
+
+/** Extract menu slug from a Saleor menu or menu-item webhook payload. */
+export function extractMenuSlugFromWebhookPayload(payload: unknown): string | null {
+	if (!payload || typeof payload !== "object") return null;
+
+	const data = payload as Record<string, unknown>;
+
+	if (data.menu && typeof data.menu === "object") {
+		const slug = (data.menu as Record<string, unknown>).slug;
+		if (typeof slug === "string" && slug.length > 0) return slug;
+	}
+
+	if (data.menuItem && typeof data.menuItem === "object") {
+		const menu = (data.menuItem as Record<string, unknown>).menu;
+		if (menu && typeof menu === "object") {
+			const slug = (menu as Record<string, unknown>).slug;
+			if (typeof slug === "string" && slug.length > 0) return slug;
+		}
+	}
+
+	return null;
+}
+
+/** Extract page slug from a Saleor page webhook payload. */
+export function extractPageSlugFromWebhookPayload(payload: unknown): string | null {
+	if (!payload || typeof payload !== "object") return null;
+
+	const data = payload as Record<string, unknown>;
+
+	if (data.page && typeof data.page === "object") {
+		const slug = (data.page as Record<string, unknown>).slug;
+		if (typeof slug === "string" && slug.length > 0) return slug;
+	}
+
+	return null;
+}
+
+/** Build channel-scoped menu tags for every storefront channel. */
+export function buildMenuRevalidationTags(
+	menuSlug: string,
+	channels: readonly string[],
+): Array<{ tag: string; profile: CacheLifeProfile }> {
+	const profile = resolveCacheProfileForMenuSlug(menuSlug);
+	if (!profile || channels.length === 0) return [];
+
+	return channels.map((channel) => ({
+		tag: buildTag(profile, { channel }),
+		profile: profile.cacheProfile,
+	}));
+}
+
+export type MenuRevalidationPlan =
+	| { action: "revalidate"; menuSlug: string; tags: Array<{ tag: string; profile: CacheLifeProfile }> }
+	| { action: "skip"; reason: "missing_slug" | "unknown_menu" }
+	| { action: "error"; reason: "no_channels" };
+
+/** Pure planner for menu webhook invalidation — keeps route handler thin and testable. */
+export function planMenuRevalidation(
+	menuSlug: string | undefined,
+	channels: readonly string[],
+): MenuRevalidationPlan {
+	if (!menuSlug) return { action: "skip", reason: "missing_slug" };
+	if (channels.length === 0) return { action: "error", reason: "no_channels" };
+
+	const tags = buildMenuRevalidationTags(menuSlug, channels);
+	if (tags.length === 0) return { action: "skip", reason: "unknown_menu" };
+
+	return { action: "revalidate", menuSlug, tags };
+}
+
+export type PageRevalidationPlan =
+	| { action: "revalidate"; slug: string; tag: string; profile: CacheLifeProfile; paths: string[] }
+	| { action: "skip"; reason: "missing_slug" }
+	| { action: "error"; reason: "no_channels" };
+
+/** Plan CMS page invalidation — tag is slug-scoped; paths are per storefront channel. */
+export function planPageRevalidation(
+	slug: string | undefined,
+	channels: readonly string[],
+	fallbackChannel?: string | null,
+): PageRevalidationPlan {
+	if (!slug) return { action: "skip", reason: "missing_slug" };
+
+	const channelList = channels.length > 0 ? channels : fallbackChannel ? [fallbackChannel] : [];
+	if (channelList.length === 0) return { action: "error", reason: "no_channels" };
+
+	const paths = channelList.flatMap((channel) =>
+		buildPathsForAllLocales(CACHE_PROFILES.pages, { channel, slug }),
+	);
+
+	return {
+		action: "revalidate",
+		slug,
+		tag: buildTag(CACHE_PROFILES.pages, slug),
+		profile: CACHE_PROFILES.pages.cacheProfile,
+		paths,
+	};
+}
+
+export type StorefrontContentRevalidationPlan =
+	| {
+			action: "revalidate";
+			tags: Array<{ tag: string; profile: CacheLifeProfile }>;
+			paths: string[];
+	  }
+	| { action: "skip"; reason: "not_storefront_singleton" | "no_channels" };
+
+/**
+ * Plan invalidation for Saleor `storefront-*` singleton pages (`default`, `default-{channel}`).
+ * Merges with editorial CMS page revalidation in the webhook handler.
+ */
+export function planStorefrontContentRevalidation(
+	pageSlug: string | undefined,
+	channels: readonly string[],
+	fallbackChannel?: string | null,
+): StorefrontContentRevalidationPlan {
+	if (!pageSlug || !isStorefrontContentPageSlug(pageSlug)) {
+		return { action: "skip", reason: "not_storefront_singleton" };
+	}
+
+	const channelList = channels.length > 0 ? channels : fallbackChannel ? [fallbackChannel] : [];
+	if (channelList.length === 0) return { action: "skip", reason: "no_channels" };
+
+	const targetChannels = resolveStorefrontContentChannelsForPageSlug(pageSlug, channelList);
+	if (targetChannels.length === 0) {
+		return { action: "skip", reason: "not_storefront_singleton" };
+	}
+
+	const profile = CACHE_PROFILES.storefrontContent;
+
+	return {
+		action: "revalidate",
+		tags: targetChannels.flatMap((channel) =>
+			buildStorefrontContentCacheTags(channel).map((tag) => ({
+				tag,
+				profile: profile.cacheProfile,
+			})),
+		),
+		paths: targetChannels.flatMap((channel) => buildPathsForAllLocales(profile, { channel })),
+	};
+}
+
+/** All locale cache tags for storefront marketing copy on a channel. */
+export function buildStorefrontContentCacheTags(channel: string): string[] {
+	return getLocaleBcp47List().map((locale) =>
+		buildTag(CACHE_PROFILES.storefrontContent, { channel, locale }),
+	);
+}
+
+function normalizeTagParams(params?: string | CacheTagParams): CacheTagParams {
+	if (typeof params === "string") {
+		return { slug: params };
+	}
+	return params ?? {};
+}
+
+export function tagPatternHasPlaceholders(pattern: string): boolean {
+	return pattern.includes("{slug}") || pattern.includes("{channel}") || pattern.includes("{locale}");
+}
+
+export function isGlobalTagProfile(profile: CacheProfile): boolean {
+	return !tagPatternHasPlaceholders(profile.tagPattern);
+}
+
+/**
+ * Profiles tagged per channel only (e.g. navigation:{channel}, footer-menu:{channel}).
+ * Excludes channel+locale profiles (storefront-content) and slug-scoped catalog tags.
+ */
+export function isChannelScopedTagProfile(profile: CacheProfile): boolean {
+	return (
+		profile.tagPattern.includes("{channel}") &&
+		!profile.tagPattern.includes("{slug}") &&
+		!profile.tagPattern.includes("{locale}")
+	);
+}
+
+/** Profiles tagged per channel × locale (e.g. storefront-content:{channel}:{locale}). */
+export function isChannelLocaleScopedTagProfile(profile: CacheProfile): boolean {
+	return (
+		profile.tagPattern.includes("{channel}") &&
+		profile.tagPattern.includes("{locale}") &&
+		!profile.tagPattern.includes("{slug}")
+	);
+}
+
+export function getChannelScopedTagProfiles(): CacheProfile[] {
+	return CACHE_PROFILE_LIST.filter(isChannelScopedTagProfile);
+}
+
+export function getChannelLocaleScopedTagProfiles(): CacheProfile[] {
+	return CACHE_PROFILE_LIST.filter(isChannelLocaleScopedTagProfile);
+}
+
+/**
+ * Enumerable tags for a full purge (`?all=1`).
+ *
+ * Covers global, channel-scoped, channel×locale, and shared catalog tags
+ * (`products`, `categories`, …). Per-slug tags are not enumerated — shared
+ * tags bust every `"use cache"` entry that carries them.
+ */
+export function planFullPurgeTagEntries(
+	channels: readonly string[],
+): Array<{ tag: string; profile: CacheLifeProfile }> {
+	const entries: Array<{ tag: string; profile: CacheLifeProfile }> = [];
+
+	for (const profile of CACHE_PROFILE_LIST) {
+		if (profile.sharedTag) {
+			entries.push({ tag: profile.sharedTag, profile: profile.cacheProfile });
+		}
+
+		// Channel-scoped catch-alls (listing grids) — the per-slug tags can't be
+		// enumerated, but every entry also carries the catch-all.
+		if (profile.sharedTagPattern) {
+			for (const channel of channels) {
+				entries.push({
+					tag: buildCatchAllTag(profile, channel),
+					profile: profile.cacheProfile,
+				});
+			}
+		}
+
+		if (isGlobalTagProfile(profile)) {
+			entries.push({ tag: buildTag(profile), profile: profile.cacheProfile });
+			continue;
+		}
+
+		if (isChannelScopedTagProfile(profile)) {
+			for (const channel of channels) {
+				entries.push({
+					tag: buildTag(profile, { channel }),
+					profile: profile.cacheProfile,
+				});
+			}
+			continue;
+		}
+
+		if (isChannelLocaleScopedTagProfile(profile)) {
+			for (const channel of channels) {
+				for (const locale of getLocaleBcp47List()) {
+					entries.push({
+						tag: buildTag(profile, { channel, locale }),
+						profile: profile.cacheProfile,
+					});
+				}
+			}
+		}
+	}
+
+	return entries;
+}
+
+function tagPatternToRegExp(pattern: string): RegExp {
+	const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	return new RegExp(
+		`^${escaped
+			.replace("\\{slug\\}", "[^:]+")
+			.replace("\\{channel\\}", "[^:]+")
+			.replace("\\{locale\\}", "[^:]+")}$`,
+	);
+}
+
+/**
+ * Resolve the cacheLife profile for a concrete tag string (manual revalidation).
+ * Falls back to catalog tier for unknown tags.
+ */
+export function resolveCacheLifeProfileForTag(tag: string): CacheLifeProfile {
+	return resolveRevalidateCacheLifeProfile(tag, null, resolveCacheLifeProfileForTagFromManifest);
+}
+
+function resolveCacheLifeProfileForTagFromManifest(tag: string): CacheLifeProfile {
+	for (const profile of CACHE_PROFILE_LIST) {
+		if (profile.sharedTag === tag) return profile.cacheProfile;
+		if (profile.sharedTagPattern && tagPatternToRegExp(profile.sharedTagPattern).test(tag)) {
+			return profile.cacheProfile;
+		}
+		if (isGlobalTagProfile(profile)) {
+			if (tag === profile.tagPattern) return profile.cacheProfile;
+			continue;
+		}
+		if (tagPatternToRegExp(profile.tagPattern).test(tag)) {
+			return profile.cacheProfile;
+		}
+	}
+	return DEFAULT_PAPER_CACHE_LIFE_PROFILE;
+}
+
+/** @internal Exported for revalidate route profile override resolution. */
+export function resolveRevalidateProfileForTag(
+	tag: string,
+	profileOverride: string | null | undefined,
+): CacheLifeProfile {
+	return resolveRevalidateCacheLifeProfile(tag, profileOverride, resolveCacheLifeProfileForTagFromManifest);
+}
+
+/**
+ * Resolve a manual revalidation tag from profile id/shorthand + optional channel.
+ *
+ * @example resolveManualRevalidateTag("navigation", "default-channel") → "navigation:default-channel"
+ */
+export function resolveManualRevalidateTag(tag: string, channel?: string | null): string {
+	if (!channel || UNRESOLVED_PLACEHOLDER.test(tag)) {
+		return tag;
+	}
+
+	for (const profile of CACHE_PROFILE_LIST) {
+		if (!isChannelScopedTagProfile(profile)) continue;
+
+		const shorthand = profile.tagPattern.replace(":{channel}", "");
+		if (tag === profile.id || tag === shorthand) {
+			return buildTag(profile, { channel });
+		}
+	}
+
+	return tag;
+}
+
+// ============================================================================
+// Helpers for "use cache" functions
+// ============================================================================
+
+/**
+ * Apply cacheLife + cacheTag for a profile inside a "use cache" function body.
+ * Pass `slug` and/or `channel` when the profile's tagPattern contains placeholders.
+ * Slug-scoped profiles also receive `sharedTag` (and channel+slug profiles their
+ * channel catch-all) so full purge can bust the whole set without enumerating slugs.
+ *
+ * Profile timings are defined in src/lib/saleor/cache/life-profiles.ts (registered in next.config.js).
+ */
+/**
+ * TTL-only listing cache. Search-engine providers have no Saleor tag to bust,
+ * so this applies `listingTtl` and no `cacheTag`. Call from inside `"use cache"`.
+ */
+export function applyListingTtl(): void {
+	applyCacheLife("listingTtl");
+}
+
+export function applyCacheProfile(profile: CacheProfile, params?: string | CacheTagParams) {
+	applyCacheLife(profile.cacheProfile);
+	const tags = [buildTag(profile, params)];
+	if (profile.sharedTag) {
+		tags.push(profile.sharedTag);
+	}
+	if (profile.sharedTagPattern) {
+		tags.push(resolveTagPattern(profile, profile.sharedTagPattern, params));
+	}
+	cacheTag(...tags);
+}
+
+/**
+ * Next 16.3 generates one `cacheLife` overload per profile registered in next.config.js
+ * (no catch-all `string` overload), and a union argument doesn't distribute over overloads.
+ * Exhaustive dispatch keeps each Paper tier compile-checked against the registered profiles.
+ */
+function applyCacheLife(name: PaperCacheLifeProfile): void {
+	switch (name) {
+		case "catalog":
+			return cacheLife("catalog");
+		case "menus":
+			return cacheLife("menus");
+		case "channels":
+			return cacheLife("channels");
+		case "listingTtl":
+			// Custom profile from next.config.js. The generated cacheLife overloads
+			// list built-ins only; the name is still the string `listingTtl` at runtime.
+			return cacheLife("listingTtl" as "default");
+		default: {
+			// Adding a tier without a case above must fail typecheck here — otherwise the
+			// switch falls through and the entry silently inherits Next's default timings.
+			const unregistered: never = name;
+			throw new Error(`Unregistered cacheLife profile: ${String(unregistered)}`);
+		}
+	}
+}
+
+// ============================================================================
+// Tag / path builders — used by the revalidation endpoint
+// ============================================================================
+
+export function buildTag(profile: CacheProfile, params?: string | CacheTagParams): string {
+	return resolveTagPattern(profile, profile.tagPattern, params);
+}
+
+/**
+ * Channel catch-all for a channel+slug profile (`sharedTagPattern`) — the fallback
+ * tag when an event can't name the affected slugs, and the full-purge handle.
+ */
+export function buildCatchAllTag(profile: CacheProfile, channel: string): string {
+	if (!profile.sharedTagPattern) {
+		throw new Error(`[cache-manifest] Profile "${profile.id}" has no sharedTagPattern`);
+	}
+	return resolveTagPattern(profile, profile.sharedTagPattern, { channel });
+}
+
+function resolveTagPattern(profile: CacheProfile, pattern: string, params?: string | CacheTagParams): string {
+	const { slug, channel, locale } = normalizeTagParams(params);
+	let tag = pattern;
+	if (slug) tag = tag.replaceAll("{slug}", slug);
+	if (channel) tag = tag.replaceAll("{channel}", channel);
+	if (locale) tag = tag.replaceAll("{locale}", locale);
+
+	if (UNRESOLVED_PLACEHOLDER.test(tag)) {
+		const missing = (["{slug}", "{channel}", "{locale}"] as const).filter((placeholder) =>
+			tag.includes(placeholder),
+		);
+		throw new Error(
+			`[cache-manifest] Unresolved tag "${tag}" for profile "${profile.id}". ` +
+				`Provide: ${missing.join(", ")}`,
+		);
+	}
+
+	return tag;
+}
+
+export type BuildPathParams = {
+	channel: string;
+	slug?: string;
+	/** URL locale slug — defaults to configured default locale */
+	locale?: string;
+};
+
+export function buildPath(
+	profile: CacheProfile,
+	channelOrParams: string | BuildPathParams,
+	legacySlug?: string,
+): string | null {
+	if (!profile.pathPattern) return null;
+
+	const params: BuildPathParams =
+		typeof channelOrParams === "string" ? { channel: channelOrParams, slug: legacySlug } : channelOrParams;
+
+	const localeSlug = params.locale ?? getDefaultLocaleSlug();
+	let path = profile.pathPattern.replaceAll("{locale}", localeSlug).replaceAll("{channel}", params.channel);
+	if (params.slug) path = path.replaceAll("{slug}", params.slug);
+	return path;
+}
+
+/** Fan out a path pattern across all configured storefront locale slugs. */
+export function buildPathsForAllLocales(
+	profile: CacheProfile,
+	params: Omit<BuildPathParams, "locale">,
+): string[] {
+	return getStorefrontLocaleSlugs()
+		.map((locale) => buildPath(profile, { ...params, locale }))
+		.filter((path): path is string => path !== null);
+}
+
+// ============================================================================
+// Manifest for /api/cache-info
+// ============================================================================
+
+// v7: listing tags sharded by surface/slug (listing:all|category|collection) with
+// channel catch-alls — replaces the channel-wide product-listing:{channel} tag.
+const MANIFEST_VERSION = 7;
+
+const STOREFRONT_MANIFEST_ENVIRONMENTS = ["production", "preview", "development", "staging"] as const;
+
+/** Manifest v6+ — which Saleor backend this deploy talks to (Paper handshake). */
+export type StorefrontManifestEnvironment = (typeof STOREFRONT_MANIFEST_ENVIRONMENTS)[number];
+
+export interface StorefrontManifestIdentity {
+	saleorApiUrl: string;
+	environment?: StorefrontManifestEnvironment;
+	buildId?: string;
+	commit?: string;
+	branch?: string;
+}
+
+function isStorefrontManifestEnvironment(value: string): value is StorefrontManifestEnvironment {
+	return (STOREFRONT_MANIFEST_ENVIRONMENTS as readonly string[]).includes(value);
+}
+
+/**
+ * Map deploy hints to Paper's environment ladder.
+ * Prefer explicit `PAPER_STOREFRONT_ENVIRONMENT`, then Vercel, then NODE_ENV.
+ *
+ * An explicit but invalid override does **not** fall through — reporting the
+ * wrong ladder rung is worse for the Paper handshake than omitting it.
+ */
+export function resolveStorefrontManifestEnvironment(
+	// Next 16.3 types `ProcessEnv.NODE_ENV` as required; helpers accept partial bags for tests.
+	env: Partial<NodeJS.ProcessEnv> = process.env,
+): StorefrontManifestEnvironment | undefined {
+	const rawExplicit = env.PAPER_STOREFRONT_ENVIRONMENT?.trim();
+	if (rawExplicit) {
+		const explicit = rawExplicit.toLowerCase();
+		if (isStorefrontManifestEnvironment(explicit)) return explicit;
+		console.warn(
+			`[cache-manifest] Ignoring invalid PAPER_STOREFRONT_ENVIRONMENT="${rawExplicit}". ` +
+				`Expected ${STOREFRONT_MANIFEST_ENVIRONMENTS.join("|")}.`,
+		);
+		return undefined;
+	}
+
+	const vercel = env.VERCEL_ENV?.trim().toLowerCase();
+	// Vercel only emits production|preview|development — never staging.
+	if (vercel === "production" || vercel === "preview" || vercel === "development") {
+		return vercel;
+	}
+
+	if (env.NODE_ENV === "development") return "development";
+	if (env.NODE_ENV === "production") return "production";
+	return undefined;
+}
+
+/** Canonicalize Saleor GraphQL URL for handshake equality (trailing slash). */
+export function normalizeSaleorApiUrlForManifest(url: string): string {
+	return url.endsWith("/") ? url : `${url}/`;
+}
+
+/** Build the v6 identity block from env — omitted when Saleor URL is unset. */
+export function buildStorefrontManifestIdentity(
+	env: Partial<NodeJS.ProcessEnv> = process.env,
+): StorefrontManifestIdentity | undefined {
+	const rawSaleorApiUrl = env.NEXT_PUBLIC_SALEOR_API_URL?.trim();
+	if (!rawSaleorApiUrl) return undefined;
+
+	const identity: StorefrontManifestIdentity = {
+		saleorApiUrl: normalizeSaleorApiUrlForManifest(rawSaleorApiUrl),
+	};
+	const environment = resolveStorefrontManifestEnvironment(env);
+	if (environment) identity.environment = environment;
+
+	const buildId = env.VERCEL_DEPLOYMENT_ID?.trim();
+	if (buildId) identity.buildId = buildId;
+
+	const commit = env.VERCEL_GIT_COMMIT_SHA?.trim();
+	if (commit) identity.commit = commit;
+
+	const branch = env.VERCEL_GIT_COMMIT_REF?.trim();
+	if (branch) identity.branch = branch;
+
+	return identity;
+}
+
+export function buildManifest() {
+	const identity = buildStorefrontManifestIdentity();
+
+	return {
+		version: MANIFEST_VERSION,
+		cacheLifeTiers: paperCacheLifeProfileDocs,
+		profiles: CACHE_PROFILE_LIST.map((p) => ({
+			id: p.id,
+			label: p.label,
+			cacheProfile: p.cacheProfile,
+			tagPattern: p.tagPattern,
+			pathPattern: p.pathPattern,
+			...(p.sharedTag ? { sharedTag: p.sharedTag } : {}),
+			...(p.sharedTagPattern ? { sharedTagPattern: p.sharedTagPattern } : {}),
+		})),
+		locales: [...getStorefrontLocaleSlugs()],
+		defaultLocale: getDefaultLocaleSlug(),
+		channels: getStaticStorefrontChannelSlugs(),
+		menuSlugs: Object.keys(STOREFRONT_MENU_SLUGS),
+		...(identity ? { identity } : {}),
+	};
+}

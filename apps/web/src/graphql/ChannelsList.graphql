@@ -1,0 +1,12 @@
+query ChannelsList {
+	channels {
+		id
+		name
+		slug
+		isActive
+		currencyCode
+		defaultCountry {
+			code
+		}
+	}
+}

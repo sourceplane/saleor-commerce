@@ -1,0 +1,76 @@
+fragment VariantDetails on ProductVariant {
+	...VariantDetailsExtension
+	id
+	name
+	sku
+	quantityAvailable
+	translation(languageCode: $languageCode) {
+		name
+	}
+	selectionAttributes: attributes(variantSelection: VARIANT_SELECTION) {
+		values {
+			name
+			slug
+			value
+			translation(languageCode: $languageCode) {
+				name
+			}
+			file {
+				url
+			}
+		}
+		attribute {
+			name
+			slug
+			inputType
+			translation(languageCode: $languageCode) {
+				name
+			}
+		}
+	}
+	nonSelectionAttributes: attributes(variantSelection: NOT_VARIANT_SELECTION) {
+		values {
+			name
+			slug
+			value
+			translation(languageCode: $languageCode) {
+				name
+			}
+			file {
+				url
+			}
+		}
+		attribute {
+			name
+			slug
+			inputType
+			translation(languageCode: $languageCode) {
+				name
+			}
+		}
+	}
+	media {
+		# Main-stage srcset stays in sync with PDP_GALLERY_RUNGS (512/1024/2048).
+		# url256 is the PDP thumb strip — never pass the 2048 URL to next/image.
+		url(size: 2048, sizeRounding: UP, format: WEBP)
+		url256: url(size: 256, sizeRounding: UP, format: WEBP)
+		url512: url(size: 512, sizeRounding: UP, format: WEBP)
+		url1024: url(size: 1024, sizeRounding: UP, format: WEBP)
+		alt
+		type
+	}
+	pricing {
+		price {
+			gross {
+				currency
+				amount
+			}
+		}
+		priceUndiscounted {
+			gross {
+				currency
+				amount
+			}
+		}
+	}
+}

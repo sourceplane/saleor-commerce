@@ -10,3 +10,14 @@ onlyBuiltDependencies:
   - esbuild
   - workerd
   - sharp
+
+# The storefront's own pins (upstream's pnpm-workspace.yaml): one graphql for
+# the generated types and urql, and floors under transitive packages with
+# advisories.
+overrides:
+  graphql: 16.8.1
+  dset: ">=3.1.4"
+  micromatch: ">=4.0.8"
+  "@babel/runtime": ">=7.26.10"
+  "@babel/helpers": ">=7.26.10"
+  "brace-expansion@>=2": ">=2.0.2"
