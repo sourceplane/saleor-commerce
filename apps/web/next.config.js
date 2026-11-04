@@ -10,9 +10,17 @@ import {
 } from "./src/lib/public-asset-cache.data.mjs";
 
 /** Hostnames for mobile/tunnel dev (ngrok, LAN). See ALLOWED_DEV_ORIGINS in .env.example */
-const allowedDevOrigins = process.env.ALLOWED_DEV_ORIGINS?.split(",")
-	.map((origin) => origin.trim())
-	.filter(Boolean);
+const allowedDevOrigins = [
+	// Dev server only (`next build` ignores it): orun.work's live Preview tab
+	// loads `next dev` from the preview's own host, and Next.js refuses the
+	// hot reload and other /_next/* dev requests from an origin it is not told
+	// about. These are the preview's hosts, prod's and stage's.
+	"*.orun-preview.app",
+	"preview-gateway-stage.oruncloud.workers.dev",
+	...(process.env.ALLOWED_DEV_ORIGINS?.split(",")
+		.map((origin) => origin.trim())
+		.filter(Boolean) ?? []),
+];
 
 const isDevelopment = process.env.NODE_ENV === "development";
 
@@ -81,6 +89,18 @@ const config = {
 	experimental: {
 		useCache: true,
 		optimizePackageImports: ["lucide-react", "lodash-es"],
+		// Dev server only: behind orun.work's live Preview the browser's Origin
+		// is the preview's host while `next dev` sees a local Host, and Next.js
+		// refuses a Server Action from an origin it is not told about. `next
+		// build` runs with NODE_ENV=production, so production keeps its
+		// same-origin check.
+		...(process.env.NODE_ENV === "development"
+			? {
+					serverActions: {
+						allowedOrigins: ["*.orun-preview.app", "preview-gateway-stage.oruncloud.workers.dev"],
+					},
+				}
+			: {}),
 		// Note: API rate limiting is handled by RequestQueue in src/lib/graphql.ts
 		// (max 3 concurrent requests; the inter-request delay applies at build time only)
 	},
